@@ -28,6 +28,7 @@ RUN adduser -D -g '' appuser
 WORKDIR /app
 
 COPY --from=builder /app/chatbot .
+COPY --from=builder /app/contexts ./contexts
 
 USER appuser
 
