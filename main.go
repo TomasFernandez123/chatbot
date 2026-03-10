@@ -42,6 +42,11 @@ func main() {
 		allowedOrigins[i] = strings.TrimSpace(o)
 	}
 
+	contextsDir := os.Getenv("CONTEXTS_DIR")
+	if contextsDir == "" {
+		contextsDir = "./contexts"
+	}
+
 	// Initialize AI service
 	ctx := context.Background()
 	aiService, err := ai.NewService(ctx, apiKey)
@@ -51,7 +56,7 @@ func main() {
 	defer aiService.Close()
 
 	// Build the HTTP server
-	handlers := server.NewHandlers(aiService)
+	handlers := server.NewHandlers(aiService, contextsDir)
 	router := server.NewRouter(handlers, allowedOrigins)
 
 	srv := &http.Server{

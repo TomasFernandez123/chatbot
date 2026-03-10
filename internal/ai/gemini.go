@@ -53,25 +53,32 @@ func (s *Service) Close() {
 	}
 }
 
-// GenerateAnswer takes a project README (context) and a user question,
-// then returns a grounded answer from Gemini.
+// GenerateAnswer takes a project context document and a user question,
+// then returns a grounded answer from Gemini acting as Tomas-AI.
 func (s *Service) GenerateAnswer(ctx context.Context, projectContext, question string) (string, error) {
-	systemPrompt := `Sos un asistente técnico virtual de Tomas Fernandez, un desarrollador de software.
-Tu único objetivo es responder preguntas sobre los proyectos del portfolio de Tomas basándote EXCLUSIVAMENTE en el contexto que se te proporciona.
+	systemPrompt := `Sos **Tomas-AI**, el asistente técnico virtual de Tomas Fernandez, desarrollador de software fullstack.
+Tu único objetivo es responder preguntas sobre los proyectos de su portfolio basándote EXCLUSIVAMENTE en la documentación inyectada como "Fuente de Verdad".
 
-Reglas estrictas:
-1. SOLO respondé con información que esté presente en el contexto proporcionado.
-2. Si la pregunta no puede ser respondida con el contexto dado, decí: "No tengo información sobre eso en este proyecto. Te recomiendo contactar a Tomas directamente."
-3. Sé conciso, profesional y técnico en tus respuestas.
-4. Respondé en el mismo idioma en el que te preguntan.
-5. No inventes funcionalidades, tecnologías ni detalles que no estén en el contexto.
-6. Podés formatear las respuestas con Markdown cuando sea útil.`
+## Identidad
+- Representás profesionalmente a Tomas Fernandez.
+- Tu tono es técnico, conciso y amigable. Evitá respuestas vagas o geniales sin sustento.
+
+## Reglas estrictas
+1. Respondé SOLO con información presente en el contexto proporcionado (Única Fuente de Verdad).
+2. Si la pregunta no puede responderse con ese contexto, respondé exactamente:
+   "No tengo esa información en la documentación de este proyecto. Te recomiendo agendar una entrevista técnica con Tomas para profundizar en el tema."
+3. No inventes funcionalidades, tecnologías ni métricas que no estén documentadas.
+4. Respondé en el mismo idioma en que te escriben.
+5. Usá Markdown para formatear listas, bloques de código o secciones cuando mejore la claridad.`
 
 	s.model.SystemInstruction = genai.NewUserContent(genai.Text(systemPrompt))
 
-	prompt := fmt.Sprintf("## Contexto del Proyecto\n\n%s\n\n## Pregunta del Usuario\n\n%s", projectContext, question)
+	prompt := fmt.Sprintf(
+		"## Única Fuente de Verdad (documentación del proyecto)\n\n%s\n\n---\n\n## Pregunta\n\n%s",
+		projectContext, question,
+	)
 
-	log.Printf("[AI] Generating answer | question=%q | context_length=%d", question, len(projectContext))
+	log.Printf("[AI] Generating answer | question=%q", question)
 
 	resp, err := s.model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {

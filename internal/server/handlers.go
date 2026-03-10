@@ -4,16 +4,34 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/TomasFernandez123/chatbot/internal/ai"
 )
 
+// slugRegex only allows safe characters, preventing any path-traversal attack.
+var slugRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// masterContext is the fallback used when no project-specific file is found.
+const masterContext = `# Tomas Fernandez — Desarrollador de Software
+
+Tomas Fernandez es un desarrollador de software fullstack con experiencia en
+tecnologías modernas como Go, Angular, React, Node.js, Docker y servicios cloud.
+
+Ha trabajado en múltiples proyectos propios y freelance, construyendo plataformas
+web completas desde el diseño hasta el despliegue en producción.
+
+Si querés conocer más sobre su trabajo o discutir una oportunidad, podés
+contactarlo directamente a través de su portfolio o LinkedIn.`
+
 // ChatRequest represents the incoming JSON payload from the frontend.
+// The frontend sends only the project slug; the backend resolves the context.
 type ChatRequest struct {
 	Message string `json:"message"`
-	Context string `json:"context"`
 	Project string `json:"project"`
 }
 
@@ -31,12 +49,41 @@ type ErrorResponse struct {
 
 // Handlers holds the dependencies for HTTP handlers.
 type Handlers struct {
-	AI *ai.Service
+	AI          *ai.Service
+	contextsDir string
 }
 
 // NewHandlers creates a new Handlers instance.
-func NewHandlers(aiService *ai.Service) *Handlers {
-	return &Handlers{AI: aiService}
+func NewHandlers(aiService *ai.Service, contextsDir string) *Handlers {
+	return &Handlers{AI: aiService, contextsDir: contextsDir}
+}
+
+// loadContext reads the Markdown documentation file for the given project slug.
+// If the file is missing or the slug is invalid, it returns the masterContext fallback.
+func (h *Handlers) loadContext(slug string) (string, bool) {
+	if !slugRegex.MatchString(slug) {
+		return masterContext, false
+	}
+
+	// Build and verify the path stays inside the contexts directory.
+	filePath := filepath.Join(h.contextsDir, slug+".md")
+	absDir, err := filepath.Abs(h.contextsDir)
+	if err != nil {
+		return masterContext, false
+	}
+	absFile, err := filepath.Abs(filePath)
+	if err != nil {
+		return masterContext, false
+	}
+	if !strings.HasPrefix(absFile, absDir+string(filepath.Separator)) {
+		return masterContext, false
+	}
+
+	data, err := os.ReadFile(absFile)
+	if err != nil {
+		return masterContext, false
+	}
+	return string(data), true
 }
 
 // HealthCheck responds with a simple status to verify the service is alive.
@@ -65,9 +112,8 @@ func (h *Handlers) Chat(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Validate inputs — don't waste tokens on empty messages
+	// Validate and sanitize inputs.
 	req.Message = strings.TrimSpace(req.Message)
-	req.Context = strings.TrimSpace(req.Context)
 	req.Project = strings.TrimSpace(req.Project)
 
 	if req.Message == "" {
@@ -75,28 +121,32 @@ func (h *Handlers) Chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Context == "" {
-		writeError(w, "context cannot be empty", http.StatusBadRequest)
-		return
+	// Resolve project context from disk (RAG local).
+	// An invalid/missing slug falls back to the master context silently.
+	projectSlug := req.Project
+	if projectSlug == "" {
+		projectSlug = "unknown"
+	}
+	projectContext, found := h.loadContext(projectSlug)
+	if !found {
+		log.Printf("[WARN] Context file not found for project=%q, using master fallback", projectSlug)
 	}
 
-	// Log the consultation
-	projectName := req.Project
-	if projectName == "" {
-		projectName = "unknown"
-	}
-	log.Printf("[CHAT] New query | project=%q | question=%q | ip=%s",
-		projectName, req.Message, r.RemoteAddr)
+	start := time.Now()
+	log.Printf("[CHAT] New query | project=%q | ip=%s | question=%q",
+		projectSlug, r.RemoteAddr, req.Message)
 
-	// Call the AI service with a timeout context
-	answer, err := h.AI.GenerateAnswer(r.Context(), req.Context, req.Message)
+	// Call the AI service — inherits the request context (handles client disconnect / timeouts).
+	answer, err := h.AI.GenerateAnswer(r.Context(), projectContext, req.Message)
 	if err != nil {
-		log.Printf("[ERROR] AI generation failed: %v", err)
+		log.Printf("[ERROR] AI generation failed | project=%q | elapsed=%s | err=%v",
+			projectSlug, time.Since(start).Round(time.Millisecond), err)
 		writeError(w, "failed to generate response", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[CHAT] Response sent | project=%q | answer_length=%d", projectName, len(answer))
+	log.Printf("[CHAT] Response sent | project=%q | elapsed=%s | answer_length=%d",
+		projectSlug, time.Since(start).Round(time.Millisecond), len(answer))
 
 	writeJSON(w, http.StatusOK, ChatResponse{
 		Answer:    answer,
