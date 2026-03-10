@@ -1,0 +1,26 @@
+# Binaries
+chatbot
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test binary
+*.test
+
+# Go workspace
+go.work
