@@ -10,7 +10,7 @@ import (
 )
 
 // NewRouter creates and configures the Chi router with all middleware and routes.
-func NewRouter(handlers *Handlers, allowedOrigin string) http.Handler {
+func NewRouter(handlers *Handlers, allowedOrigins []string) http.Handler {
 	r := chi.NewRouter()
 
 	// --- Middleware Stack ---
@@ -30,9 +30,9 @@ func NewRouter(handlers *Handlers, allowedOrigin string) http.Handler {
 	// Timeout: cut connections if AI takes too long (30s)
 	r.Use(middleware.Timeout(30 * time.Second))
 
-	// CORS: only allow your portfolio domain
+	// CORS: only allow configured origins
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{allowedOrigin},
+		AllowedOrigins:   allowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Content-Type", "Authorization"},
 		ExposedHeaders:   []string{"Link"},

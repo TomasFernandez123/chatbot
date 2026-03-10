@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,9 +33,13 @@ func main() {
 		port = "8080"
 	}
 
-	allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
-	if allowedOrigin == "" {
-		allowedOrigin = "http://localhost:4200"
+	allowedOriginsRaw := os.Getenv("ALLOWED_ORIGINS")
+	if allowedOriginsRaw == "" {
+		allowedOriginsRaw = "http://localhost:4200"
+	}
+	allowedOrigins := strings.Split(allowedOriginsRaw, ",")
+	for i, o := range allowedOrigins {
+		allowedOrigins[i] = strings.TrimSpace(o)
 	}
 
 	// Initialize AI service
@@ -47,7 +52,7 @@ func main() {
 
 	// Build the HTTP server
 	handlers := server.NewHandlers(aiService)
-	router := server.NewRouter(handlers, allowedOrigin)
+	router := server.NewRouter(handlers, allowedOrigins)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
@@ -76,7 +81,7 @@ func main() {
 	log.Printf("╔══════════════════════════════════════════╗")
 	log.Printf("║  🤖 Chatbot Backend - Tomas Fernandez   ║")
 	log.Printf("║  📡 Listening on port %s                ║", port)
-	log.Printf("║  🌐 CORS origin: %-23s║", allowedOrigin)
+	log.Printf("║  🌐 CORS origins: %v", allowedOrigins)
 	log.Printf("╚══════════════════════════════════════════╝")
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
