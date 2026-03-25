@@ -24,3 +24,20 @@ Thumbs.db
 
 # Go workspace
 go.work
+
+.nexuscli/
+
+.nexuscli
+
+.nexuscli/db
+
+.nexuscli/*
+
+.agent
+.agent/*
+.agents/*
+.agents
+
+.atl
+
+.atl/*

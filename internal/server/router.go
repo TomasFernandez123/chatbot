@@ -27,9 +27,6 @@ func NewRouter(handlers *Handlers, allowedOrigins []string) http.Handler {
 	// Recover from panics gracefully
 	r.Use(middleware.Recoverer)
 
-	// Timeout: cut connections if AI takes too long (30s)
-	r.Use(middleware.Timeout(30 * time.Second))
-
 	// CORS: only allow configured origins
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   allowedOrigins,
@@ -44,7 +41,14 @@ func NewRouter(handlers *Handlers, allowedOrigins []string) http.Handler {
 	r.Use(securityHeaders)
 
 	// --- Routes ---
-	r.Get("/health", handlers.HealthCheck)
+	r.Group(func(r chi.Router) {
+		// Keep timeout for non-streaming routes.
+		r.Use(middleware.Timeout(30 * time.Second))
+		r.Get("/health", handlers.HealthCheck)
+	})
+
+	// /chat supports both classic JSON and NDJSON streaming.
+	// It must not inherit the 30s middleware timeout to avoid cutting long streams.
 	r.Post("/chat", handlers.Chat)
 
 	return r

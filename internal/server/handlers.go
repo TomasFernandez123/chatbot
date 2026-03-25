@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/TomasFernandez123/chatbot/internal/ai"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 )
 
 // slugRegex only allows safe characters, preventing any path-traversal attack.
@@ -51,11 +54,29 @@ type ErrorResponse struct {
 type Handlers struct {
 	AI          *ai.Service
 	contextsDir string
+
+	generateAnswer       func(ctx context.Context, projectContext, question string) (string, error)
+	generateAnswerStream func(ctx context.Context, projectContext, question string, onChunk func(string) error) error
 }
 
 // NewHandlers creates a new Handlers instance.
 func NewHandlers(aiService *ai.Service, contextsDir string) *Handlers {
-	return &Handlers{AI: aiService, contextsDir: contextsDir}
+	return &Handlers{
+		AI:          aiService,
+		contextsDir: contextsDir,
+		generateAnswer: func(ctx context.Context, projectContext, question string) (string, error) {
+			if aiService == nil {
+				return "", errors.New("service unavailable")
+			}
+			return aiService.GenerateAnswer(ctx, projectContext, question)
+		},
+		generateAnswerStream: func(ctx context.Context, projectContext, question string, onChunk func(string) error) error {
+			if aiService == nil {
+				return errors.New("service unavailable")
+			}
+			return aiService.GenerateAnswerStream(ctx, projectContext, question, onChunk)
+		},
+	}
 }
 
 // loadContext reads the Markdown documentation file for the given project slug.
@@ -104,11 +125,96 @@ func (h *Handlers) Chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Header.Get("Accept") == "application/x-ndjson" {
+		h.chatStream(w, r)
+		return
+	}
+
+	h.chatClassic(w, r)
+}
+
+func (h *Handlers) chatClassic(w http.ResponseWriter, r *http.Request) {
+	req, projectSlug, projectContext, ok := h.parseChatRequest(w, r)
+	if !ok {
+		return
+	}
+
+	requestID := chimiddleware.GetReqID(r.Context())
+
+	start := time.Now()
+	log.Printf("[CHAT] New query | request_id=%q | project=%q | ip=%s | question=%q",
+		requestID, projectSlug, r.RemoteAddr, req.Message)
+
+	answer, err := h.generateAnswer(r.Context(), projectContext, req.Message)
+	if err != nil {
+		log.Printf("[ERROR] AI generation failed | request_id=%q | project=%q | elapsed=%s | err=%v",
+			requestID, projectSlug, time.Since(start).Round(time.Millisecond), err)
+		writeError(w, "failed to generate response", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[CHAT] Response sent | request_id=%q | project=%q | elapsed=%s | answer_length=%d",
+		requestID, projectSlug, time.Since(start).Round(time.Millisecond), len(answer))
+
+	writeJSON(w, http.StatusOK, ChatResponse{
+		Answer:    answer,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (h *Handlers) chatStream(w http.ResponseWriter, r *http.Request) {
+	req, projectSlug, projectContext, ok := h.parseChatRequest(w, r)
+	if !ok {
+		return
+	}
+
+	requestID := chimiddleware.GetReqID(r.Context())
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Accel-Buffering", "off")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	flush := func() {
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+
+	emit := func(frame streamFrame) error {
+		if err := writeNDJSONFrame(w, frame); err != nil {
+			return err
+		}
+		flush()
+		return nil
+	}
+
+	start := time.Now()
+	log.Printf("[CHAT] Streaming enabled | request_id=%q | project=%q | ip=%s | question=%q",
+		requestID, projectSlug, r.RemoteAddr, req.Message)
+
+	err := h.generateAnswerStream(r.Context(), projectContext, req.Message, func(chunk string) error {
+		return emit(streamFrame{Type: "token", Text: chunk})
+	})
+	if err != nil {
+		log.Printf("[ERROR] AI streaming failed | request_id=%q | project=%q | elapsed=%s | err=%v",
+			requestID, projectSlug, time.Since(start).Round(time.Millisecond), err)
+		_ = emit(streamFrame{Type: "error", Message: err.Error()})
+		return
+	}
+
+	log.Printf("[CHAT] Streaming completed | request_id=%q | project=%q | elapsed=%s",
+		requestID, projectSlug, time.Since(start).Round(time.Millisecond))
+	_ = emit(streamFrame{Type: "done"})
+}
+
+func (h *Handlers) parseChatRequest(w http.ResponseWriter, r *http.Request) (ChatRequest, string, string, bool) {
+
 	// Decode request body
 	var req ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, "invalid request body", http.StatusBadRequest)
-		return
+		return ChatRequest{}, "", "", false
 	}
 	defer r.Body.Close()
 
@@ -118,7 +224,7 @@ func (h *Handlers) Chat(w http.ResponseWriter, r *http.Request) {
 
 	if req.Message == "" {
 		writeError(w, "message cannot be empty", http.StatusBadRequest)
-		return
+		return ChatRequest{}, "", "", false
 	}
 
 	// Resolve project context from disk (RAG local).
@@ -132,26 +238,23 @@ func (h *Handlers) Chat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[WARN] Context file not found for project=%q, using master fallback", projectSlug)
 	}
 
-	start := time.Now()
-	log.Printf("[CHAT] New query | project=%q | ip=%s | question=%q",
-		projectSlug, r.RemoteAddr, req.Message)
+	return req, projectSlug, projectContext, true
+}
 
-	// Call the AI service — inherits the request context (handles client disconnect / timeouts).
-	answer, err := h.AI.GenerateAnswer(r.Context(), projectContext, req.Message)
+type streamFrame struct {
+	Type    string `json:"type"`
+	Text    string `json:"text,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+func writeNDJSONFrame(w http.ResponseWriter, frame streamFrame) error {
+	line, err := json.Marshal(frame)
 	if err != nil {
-		log.Printf("[ERROR] AI generation failed | project=%q | elapsed=%s | err=%v",
-			projectSlug, time.Since(start).Round(time.Millisecond), err)
-		writeError(w, "failed to generate response", http.StatusInternalServerError)
-		return
+		return err
 	}
-
-	log.Printf("[CHAT] Response sent | project=%q | elapsed=%s | answer_length=%d",
-		projectSlug, time.Since(start).Round(time.Millisecond), len(answer))
-
-	writeJSON(w, http.StatusOK, ChatResponse{
-		Answer:    answer,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-	})
+	line = append(line, '\n')
+	_, err = w.Write(line)
+	return err
 }
 
 // writeJSON writes a JSON response with the given status code.

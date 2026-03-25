@@ -2,18 +2,33 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 
 	"github.com/google/generative-ai-go/genai"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
+type streamResponseIterator interface {
+	Next() (*genai.GenerateContentResponse, error)
+}
+
+type sdkStreamResponseIterator struct {
+	iter *genai.GenerateContentResponseIterator
+}
+
+func (s *sdkStreamResponseIterator) Next() (*genai.GenerateContentResponse, error) {
+	return s.iter.Next()
+}
+
 // Service encapsulates the Gemini AI client and generation logic.
 type Service struct {
-	client *genai.Client
-	model  *genai.GenerativeModel
+	client        *genai.Client
+	model         *genai.GenerativeModel
+	streamFactory func(ctx context.Context, parts ...genai.Part) streamResponseIterator
 }
 
 // NewService creates a new AI service configured with the given API key.
@@ -43,6 +58,9 @@ func NewService(ctx context.Context, apiKey string) (*Service, error) {
 	return &Service{
 		client: client,
 		model:  model,
+		streamFactory: func(ctx context.Context, parts ...genai.Part) streamResponseIterator {
+			return &sdkStreamResponseIterator{iter: model.GenerateContentStream(ctx, parts...)}
+		},
 	}, nil
 }
 
@@ -56,7 +74,85 @@ func (s *Service) Close() {
 // GenerateAnswer takes a project context document and a user question,
 // then returns a grounded answer from Gemini acting as Tomas-AI.
 func (s *Service) GenerateAnswer(ctx context.Context, projectContext, question string) (string, error) {
-	systemPrompt := `Sos **Tomas-AI**, el asistente técnico virtual de Tomas Fernandez, desarrollador de software fullstack.
+	s.model.SystemInstruction = genai.NewUserContent(genai.Text(systemPrompt))
+	prompt := buildPrompt(projectContext, question)
+
+	log.Printf("[AI] Generating answer | question=%q", question)
+
+	resp, err := s.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		return "", fmt.Errorf("failed to generate content: %w", err)
+	}
+
+	return extractText(resp), nil
+}
+
+// GenerateAnswerStream streams Gemini response chunks and invokes onChunk for each chunk.
+// Returns nil on successful completion, SDK iterator errors, callback errors,
+// or context cancellation errors.
+func (s *Service) GenerateAnswerStream(
+	ctx context.Context,
+	projectContext, question string,
+	onChunk func(string) error,
+) error {
+	if onChunk == nil {
+		return errors.New("onChunk callback is required")
+	}
+
+	if s.model != nil {
+		s.model.SystemInstruction = genai.NewUserContent(genai.Text(systemPrompt))
+	}
+
+	stream := s.newStreamIterator(ctx, genai.Text(buildPrompt(projectContext, question)))
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		resp, err := stream.Next()
+		if err == iterator.Done {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		chunk := extractStreamText(resp)
+		// Contract: whitespace-only chunks are emitted as-is; only truly empty chunks are skipped.
+		if chunk == "" {
+			continue
+		}
+
+		if err := onChunk(chunk); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *Service) newStreamIterator(ctx context.Context, parts ...genai.Part) streamResponseIterator {
+	if s.streamFactory != nil {
+		return s.streamFactory(ctx, parts...)
+	}
+
+	return &sdkStreamResponseIterator{iter: s.model.GenerateContentStream(ctx, parts...)}
+}
+
+func extractStreamText(resp *genai.GenerateContentResponse) string {
+	if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0] == nil || resp.Candidates[0].Content == nil {
+		return ""
+	}
+
+	var sb strings.Builder
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if txt, ok := part.(genai.Text); ok {
+			sb.WriteString(string(txt))
+		}
+	}
+
+	return sb.String()
+}
+
+const systemPrompt = `Sos **Tomas-AI**, el asistente técnico virtual de Tomas Fernandez, desarrollador de software fullstack.
 Tu único objetivo es responder preguntas sobre los proyectos de su portfolio basándote EXCLUSIVAMENTE en la documentación inyectada como "Fuente de Verdad".
 
 ## Identidad
@@ -71,21 +167,11 @@ Tu único objetivo es responder preguntas sobre los proyectos de su portfolio ba
 4. Respondé en el mismo idioma en que te escriben.
 5. Usá Markdown para formatear listas, bloques de código o secciones cuando mejore la claridad.`
 
-	s.model.SystemInstruction = genai.NewUserContent(genai.Text(systemPrompt))
-
-	prompt := fmt.Sprintf(
+func buildPrompt(projectContext, question string) string {
+	return fmt.Sprintf(
 		"## Única Fuente de Verdad (documentación del proyecto)\n\n%s\n\n---\n\n## Pregunta\n\n%s",
 		projectContext, question,
 	)
-
-	log.Printf("[AI] Generating answer | question=%q", question)
-
-	resp, err := s.model.GenerateContent(ctx, genai.Text(prompt))
-	if err != nil {
-		return "", fmt.Errorf("failed to generate content: %w", err)
-	}
-
-	return extractText(resp), nil
 }
 
 // extractText pulls the text content from the Gemini response.
